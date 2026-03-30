@@ -1,0 +1,360 @@
+# Multi-Language CI/CD Pipeline Configuration
+# Detecta automáticamente el tipo de proyecto y aplica el pipeline correspondiente
+# Compatible con: Spring Boot, Angular, Flutter, TypeScript, Generic Node.js
+
+# =============================================================================
+# VARIABLES GLOBALES
+# =============================================================================
+
+variables:
+  # Docker Configuration
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+  
+  # GCP Configuration
+  GCP_PROJECT_ID: "crezcamos-prod"
+  GCP_REGION: "us-central1"
+  GKE_CLUSTER_DEV: "crezcamos-dev-cluster"
+  GKE_CLUSTER_STAGING: "crezcamos-staging-cluster"
+  GKE_CLUSTER_PROD: "crezcamos-prod-cluster"
+  
+  # Registry Configuration
+  REGISTRY_URL: "$CI_REGISTRY"
+  IMAGE_NAME: "$CI_REGISTRY_IMAGE"
+  IMAGE_TAG: "$CI_COMMIT_SHORT_SHA"
+  
+  # Security & Quality
+  TRIVY_VERSION: "0.48.0"
+  SONAR_VERSION: "5.0"
+  
+  # Kubernetes Namespaces
+  K8S_NAMESPACE_DEV: "development"
+  K8S_NAMESPACE_STAGING: "staging"
+  K8S_NAMESPACE_PROD: "production"
+  
+  # Node.js Default Version
+  NODE_VERSION: "18"
+  
+  # Flutter Default Version
+  FLUTTER_VERSION: "3.13.0"
+
+# =============================================================================
+# STAGES
+# =============================================================================
+
+stages:
+  - detect            # Detectar tipo de proyecto
+  - security-scan     # Escaneo de seguridad
+  - build             # Construcción según lenguaje
+  - test              # Pruebas (unitarias, integración, E2E)
+  - quality           # Análisis de calidad
+  - vulnerability     # Análisis de vulnerabilidades
+  - approval          # Aprobaciones manuales
+  - deploy            # Despliegue a ambientes
+  - post-deploy       # Verificaciones post-despliegue
+  - rollback          # Rollback manual
+
+# =============================================================================
+# TEMPLATES INCLUDE
+# =============================================================================
+
+include:
+  # Templates base de seguridad y despliegue
+  - local: '.gitlab/templates/security.yml'
+  - local: '.gitlab/templates/deploy.yml'
+  
+  # Templates específicos por tipo de proyecto
+  - local: '.gitlab/templates/springboot.yml'
+  - local: '.gitlab/templates/angular.yml'
+  - local: '.gitlab/templates/flutter.yml'
+  - local: '.gitlab/templates/typescript.yml'
+  
+  # Pipelines específicos por rama
+  - local: '.gitlab/ci/develop-pipeline.yml'
+    rules:
+      - if: '$CI_COMMIT_BRANCH == "develop"'
+  
+  - local: '.gitlab/ci/release-pipeline.yml'
+    rules:
+      - if: '$CI_COMMIT_BRANCH == "release"'
+  
+  - local: '.gitlab/ci/main-pipeline.yml'
+    rules:
+      - if: '$CI_COMMIT_BRANCH == "main"'
+
+# Cache global configuration
+cache:
+  key: ${CI_COMMIT_REF_SLUG}
+  paths:
+    - node_modules/
+    - .m2/repository/
+    - .gradle/
+    - vendor/
+    - .dart_tool/
+    - pub_cache/
+
+# Default configuration for all jobs
+default:
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+  tags:
+    - docker
+    - gcp
+
+# =============================================================================
+# DETECT PROJECT TYPE JOB
+# =============================================================================
+
+detect-project-type:
+  stage: detect
+  image: alpine:latest
+  script:
+    - echo "🔍 Detectando type de proyecto..."
+    
+    # Detectar Spring Boot (Java/Maven)
+    - |
+      if [ -f "pom.xml" ] || [ -f "build.gradle" ]; then
+        echo "PROJECT_TYPE=springboot" > project-type.env
+        echo "✅ Spring Boot project detectado"
+        exit 0
+      fi
+    
+    # Detectar Flutter
+    - |
+      if [ -f "pubspec.yaml" ] || [ -f "pubspec.lock" ]; then
+        echo "PROJECT_TYPE=flutter" > project-type.env
+        echo "✅ Flutter project detectado"
+        exit 0
+      fi
+    
+    # Detectar Angular
+    - |
+      if [ -f "angular.json" ]; then
+        echo "PROJECT_TYPE=angular" > project-type.env
+        echo "✅ Angular project detectado"
+        exit 0
+      fi
+    
+    # Detectar TypeScript
+    - |
+      if [ -f "tsconfig.json" ] && [ -f "package.json" ]; then
+        echo "PROJECT_TYPE=typescript" > project-type.env
+        echo "✅ TypeScript project detectado"
+        exit 0
+      fi
+    
+    # Detectar Node.js genérico
+    - |
+      if [ -f "package.json" ]; then
+        echo "PROJECT_TYPE=nodejs" > project-type.env
+        echo "✅ Node.js project detectado"
+        exit 0
+      fi
+    
+    # Por defecto
+    - |
+      echo "PROJECT_TYPE=generic" > project-type.env
+      echo "⚠️ Generic project type (no se detectó lenguaje específico)"
+  
+  artifacts:
+    reports:
+      dotenv: project-type.env
+    paths:
+      - project-type.env
+    expire_in: 1 day
+
+# =============================================================================
+# COMMON JOBS (EJECUTAN EN TODAS LAS RAMAS)
+# =============================================================================
+
+# Secret Scanning
+secret-scanning:
+  extends: .secret-scanning
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "release" || $CI_COMMIT_BRANCH == "main"'
+
+# Dependency Check
+dependency-check:
+  extends: .dependency-check
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "release" || $CI_COMMIT_BRANCH == "main"'
+  allow_failure: true
+
+# Vulnerability Scan with Trivy
+vulnerability-scan:
+  extends: .container-scan
+  stage: vulnerability
+  variables:
+    IMAGE_SCAN_TARGET: "$IMAGE_NAME:latest"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  allow_failure: false
+
+# Code Coverage Report
+code-coverage:
+  extends: .code-coverage
+  stage: quality
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "release"'
+
+# =============================================================================
+# PROJECT-TYPE-SPECIFIC BUILD JOBS
+# =============================================================================
+
+# Build Job para Spring Boot
+build-springboot:
+  extends: .springboot-build
+  rules:
+    - if: '$PROJECT_TYPE == "springboot" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "release" || $CI_COMMIT_BRANCH == "main")'
+
+build-springboot-tests:
+  extends: .springboot-tests
+  rules:
+    - if: '$PROJECT_TYPE == "springboot" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "release" || $CI_COMMIT_BRANCH == "main")'
+
+build-springboot-docker:
+  extends: .springboot-docker-build
+  rules:
+    - if: '$PROJECT_TYPE == "springboot" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "release" || $CI_COMMIT_BRANCH == "main")'
+
+# Build Job para Angular
+build-angular:
+  extends: .angular-build
+  rules:
+    - if: '$PROJECT_TYPE == "angular" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "release" || $CI_COMMIT_BRANCH == "main")'
+
+build-angular-lint:
+  extends: .angular-lint
+  rules:
+    - if: '$PROJECT_TYPE == "angular" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "release" || $CI_COMMIT_BRANCH == "main")'
+
+build-angular-tests:
+  extends: .angular-tests
+  rules:
+    - if: '$PROJECT_TYPE == "angular" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "release" || $CI_COMMIT_BRANCH == "main")'
+
+build-angular-docker:
+  extends: .angular-docker-build
+  rules:
+    - if: '$PROJECT_TYPE == "angular" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "release" || $CI_COMMIT_BRANCH == "main")'
+
+# Build Job para Flutter
+build-flutter-android:
+  extends: .flutter-build-android
+  rules:
+    - if: '$PROJECT_TYPE == "flutter" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "release" || $CI_COMMIT_BRANCH == "main")'
+
+build-flutter-ios:
+  extends: .flutter-build-ios
+  rules:
+    - if: '$PROJECT_TYPE == "flutter" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "release" || $CI_COMMIT_BRANCH == "main")'
+
+build-flutter-web:
+  extends: .flutter-build-web
+  rules:
+    - if: '$PROJECT_TYPE == "flutter" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "release" || $CI_COMMIT_BRANCH == "main")'
+
+build-flutter-tests:
+  extends: .flutter-tests
+  rules:
+    - if: '$PROJECT_TYPE == "flutter" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "release" || $CI_COMMIT_BRANCH == "main")'
+
+# Build Job para TypeScript
+build-typescript:
+  extends: .typescript-build
+  rules:
+    - if: '$PROJECT_TYPE == "typescript" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "release" || $CI_COMMIT_BRANCH == "main")'
+
+build-typescript-lint:
+  extends: .typescript-lint
+  rules:
+    - if: '$PROJECT_TYPE == "typescript" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "release" || $CI_COMMIT_BRANCH == "main")'
+
+build-typescript-tests:
+  extends: .typescript-tests
+  rules:
+    - if: '$PROJECT_TYPE == "typescript" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "release" || $CI_COMMIT_BRANCH == "main")'
+
+build-typescript-docker:
+  extends: .typescript-docker-build
+  rules:
+    - if: '$PROJECT_TYPE == "typescript" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "release" || $CI_COMMIT_BRANCH == "main")'
+
+# =============================================================================
+# QUALITY ANALYSIS JOBS (PROJECT-TYPE SPECIFIC)
+# =============================================================================
+
+sonarqube-springboot:
+  extends: .springboot-sonarqube
+  rules:
+    - if: '$PROJECT_TYPE == "springboot"'
+  allow_failure: true
+
+sonarqube-angular:
+  extends: .angular-sonarqube
+  rules:
+    - if: '$PROJECT_TYPE == "angular"'
+  allow_failure: true
+
+sonarqube-typescript:
+  extends: .typescript-sonarqube
+  rules:
+    - if: '$PROJECT_TYPE == "typescript"'
+  allow_failure: true
+
+# =============================================================================
+# NOTIFICACIONES
+# =============================================================================
+
+notify-success:
+  stage: post-deploy
+  image: curlimages/curl:latest
+  script:
+    - |
+      if [ ! -z "$SLACK_WEBHOOK_URL" ]; then
+        curl -X POST $SLACK_WEBHOOK_URL \
+          -H 'Content-Type: application/json' \
+          -d "{
+            \"text\": \"✅ Despliegue exitoso en $CI_COMMIT_BRANCH\",
+            \"blocks\": [
+              {
+                \"type\": \"section\",
+                \"text\": {
+                  \"type\": \"mrkdwn\",
+                  \"text\": \"*Pipeline exitoso*\n*Rama:* $CI_COMMIT_BRANCH\n*Proyecto:* $PROJECT_TYPE\n*Commit:* $CI_COMMIT_SHORT_SHA\n*Autor:* $GITLAB_USER_NAME\"
+                }
+              }
+            ]
+          }"
+      fi
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "release"'
+      when: on_success
+  allow_failure: true
+
+notify-failure:
+  stage: post-deploy
+  image: curlimages/curl:latest
+  script:
+    - |
+      if [ ! -z "$SLACK_WEBHOOK_URL" ]; then
+        curl -X POST $SLACK_WEBHOOK_URL \
+          -H 'Content-Type: application/json' \
+          -d "{
+            \"text\": \"❌ Pipeline fallido en $CI_COMMIT_BRANCH\",
+            \"blocks\": [
+              {
+                \"type\": \"section\",
+                \"text\": {
+                  \"type\": \"mrkdwn\",
+                  \"text\": \"*Pipeline fallido*\n*Rama:* $CI_COMMIT_BRANCH\n*Proyecto:* $PROJECT_TYPE\n*Commit:* $CI_COMMIT_SHORT_SHA\n*Autor:* $GITLAB_USER_NAME\n*URL:* $CI_PIPELINE_URL\"
+                }
+              }
+            ]
+          }"
+      fi
+  when: on_failure
+  allow_failure: true

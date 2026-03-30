@@ -1,0 +1,35 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: crezcamos-config
+  namespace: development
+  labels:
+    app: crezcamos
+    environment: development
+data:
+  environment: "development"
+  log.level: "debug"
+  cache.ttl: "300"
+  api.timeout: "30"
+  feature.flags: |
+    {
+      "newFeature": true,
+      "betaFeatures": true,
+      "debugMode": true
+    }
+  application.yml: |
+    server:
+      port: 8080
+      servlet:
+        context-path: /
+    logging:
+      level:
+        root: DEBUG
+        com.crezcamos: DEBUG
+    spring:
+      application:
+        name: crezcamos
+      jpa:
+        show-sql: true
+        hibernate:
+          ddl-auto: validate

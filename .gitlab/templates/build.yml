@@ -1,0 +1,129 @@
+# Template compartido para tareas de construcción
+# Incluye compilación, build de imagen Docker y pruebas
+
+# Job: Build Docker Image - Construye y sube imagen a registry
+.docker-build:
+  stage: build
+  image: docker:24-dind
+  services:
+    - docker:24-dind
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+  script:
+    - echo "🐳 Construyendo imagen Docker..."
+    - |
+      docker build $DOCKER_TAGS \
+        --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+        --build-arg VCS_REF=$CI_COMMIT_SHA \
+        --build-arg VERSION=$CI_COMMIT_TAG \
+        -f docker/Dockerfile .
+    - docker push $IMAGE_NAME --all-tags
+    - echo "✅ Imagen construida y subida al registry"
+  artifacts:
+    reports:
+      dotenv: build.env
+  after_script:
+    - docker logout "$CI_REGISTRY"
+
+# Job: Unit Tests - Ejecuta pruebas unitarias
+.unit-tests:
+  stage: test
+  script:
+    - echo "🧪 Ejecutando pruebas unitarias..."
+    - npm ci
+    - npm run test:unit -- --coverage
+    - echo "✅ Pruebas unitarias completadas"
+  coverage: '/All files[^|]*\|[^|]*\s+([\d\.]+)/'
+  artifacts:
+    reports:
+      junit: junit.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml
+    paths:
+      - coverage/
+    expire_in: 30 days
+  allow_failure: false
+
+# Job: E2E Tests - Ejecuta pruebas end-to-end
+.e2e-tests:
+  stage: test
+  image: cypress/included:13.6.0
+  script:
+    - echo "🎯 Ejecutando pruebas E2E..."
+    - cypress run --config-file cypress.config.js
+    - echo "✅ Pruebas E2E completadas"
+  artifacts:
+    when: always
+    reports:
+      junit: cypress/results/junit-*.xml
+    paths:
+      - cypress/screenshots/
+      - cypress/videos/
+      - cypress/results/
+    expire_in: 30 days
+  allow_failure: false
+
+# Job: Integration Tests - Ejecuta pruebas de integración
+.integration-tests:
+  stage: test
+  image: node:18-alpine
+  before_script:
+    - npm ci
+  script:
+    - echo "🔗 Ejecutando pruebas de integración..."
+    - npm run test:integration
+    - echo "✅ Pruebas de integración completadas"
+  artifacts:
+    reports:
+      junit: integration-test-results.xml
+    paths:
+      - integration-test-results/
+    expire_in: 7 days
+  allow_failure: true
+
+# Job: Performance Tests - Ejecuta pruebas de rendimiento
+.performance-tests:
+  stage: post-deploy
+  image: grafana/k6:latest
+  script:
+    - echo "⚡ Ejecutando pruebas de rendimiento..."
+    - k6 run --out json=performance-results.json scripts/performance/load-test.js
+    - echo "✅ Pruebas de rendimiento completadas"
+  artifacts:
+    paths:
+      - performance-results.json
+    expire_in: 7 days
+  allow_failure: true
+
+# Job: Security Tests - OWASP ZAP scanning
+.security-tests:
+  stage: test
+  image: owasp/zap2docker-stable:latest
+  script:
+    - echo "🔐 Ejecutando pruebas de seguridad OWASP ZAP..."
+    - |
+      zap-baseline.py \
+        -t $TEST_URL \
+        -r zap-baseline-report.html \
+        -J zap-baseline-report.json \
+        || true
+    - echo "✅ Pruebas de seguridad completadas"
+  artifacts:
+    paths:
+      - zap-baseline-report.html
+      - zap-baseline-report.json
+    expire_in: 30 days
+  allow_failure: true
+
+# Job: Build Lint - Verifica calidad del código
+.lint:
+  stage: build
+  image: node:18-alpine
+  before_script:
+    - npm ci
+  script:
+    - echo "✏️ Ejecutando linting..."
+    - npm run lint
+    - echo "✅ Linting completado"
+  allow_failure: false

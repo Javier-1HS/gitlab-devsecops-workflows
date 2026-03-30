@@ -1,0 +1,39 @@
+include: package:flutter_lints/flutter.yaml
+
+analyzer:
+  # Evita que el proyecto compile si hay advertencias graves
+  errors:
+    todo: ignore
+    missing_required_param: error
+    missing_return: error
+    unused_import: error
+    unused_local_variable: error
+    dead_code: error
+  
+  exclude:
+    - "build/**"
+    - "**/*.g.dart"      # Excluir archivos generados (JSON Serializable, etc.)
+    - "**/*.freezed.dart"
+
+linter:
+  rules:
+    # --- ERRORES COMUNES Y SEGURIDAD ---
+    - avoid_print                        # Prohibido prints en producción (usa un logger)
+    - avoid_empty_else                   # Evita estructuras lógicas vacías
+    - cancel_subscriptions               # Obliga a cerrar Streams (evita memory leaks)
+    - close_sinks                        # Obliga a cerrar Sinks
+    - no_logic_in_create_state           # La lógica va en el State, no en el StatefulWidget
+
+    # --- ESTILO Y MANTENIBILIDAD ---
+    - always_declare_return_types        # Obliga a definir qué devuelve cada función
+    - always_put_required_named_parameters_first
+    - annotate_overrides                 # Obliga a usar @override
+    - avoid_unnecessary_containers       # Limpia el árbol de widgets de Containers inútiles
+    - prefer_const_constructors          # Mejora el rendimiento usando constructores constantes
+    - prefer_const_declarations          # Usa const donde sea posible
+    - prefer_final_locals                # Inmutabilidad por defecto en variables locales
+    - prefer_single_quotes               # Consistencia: siempre comillas simples ''
+    
+    # --- DOCUMENTACIÓN ---
+    - package_api_docs                   # Útil si estás creando una librería interna
+    - sort_child_properties_last         # El 'child' siempre va al final para mejorar legibilidad

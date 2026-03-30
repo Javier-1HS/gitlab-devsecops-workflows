@@ -1,0 +1,42 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: crezcamos-config
+  namespace: production
+  labels:
+    app: crezcamos
+    environment: production
+data:
+  environment: "production"
+  log.level: "warn"
+  cache.ttl: "3600"
+  api.timeout: "30"
+  feature.flags: |
+    {
+      "newFeature": false,
+      "betaFeatures": false,
+      "debugMode": false
+    }
+  application.yml: |
+    server:
+      port: 8080
+      servlet:
+        context-path: /
+      compression:
+        enabled: true
+        min-response-size: 1024
+    logging:
+      level:
+        root: WARN
+        com.crezcamos: INFO
+    spring:
+      application:
+        name: crezcamos
+      jpa:
+        show-sql: false
+        hibernate:
+          ddl-auto: validate
+      cache:
+        type: redis
+      redis:
+        timeout: 2000ms

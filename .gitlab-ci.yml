@@ -1,0 +1,284 @@
+# GitLab CI/CD Pipeline - Crezcamos
+# Estrategia GitFlow Gobernado con Despliegue en GCP
+
+# Variables globales
+variables:
+  # Configuración de Docker
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+  
+  # GCP Configuration
+  GCP_PROJECT_ID: "crezcamos-prod"
+  GCP_REGION: "us-central1"
+  GKE_CLUSTER_DEV: "crezcamos-dev-cluster"
+  GKE_CLUSTER_STAGING: "crezcamos-staging-cluster"
+  GKE_CLUSTER_PROD: "crezcamos-prod-cluster"
+  
+  # Registry Configuration
+  REGISTRY_URL: "$CI_REGISTRY"
+  IMAGE_NAME: "$CI_REGISTRY_IMAGE"
+  IMAGE_TAG: "$CI_COMMIT_SHORT_SHA"
+  
+  # Security & Quality
+  TRIVY_VERSION: "0.48.0"
+  SONAR_VERSION: "5.0"
+  
+  # Kubernetes Namespaces
+  K8S_NAMESPACE_DEV: "development"
+  K8S_NAMESPACE_STAGING: "staging"
+  K8S_NAMESPACE_PROD: "production"
+
+# Stages del pipeline
+stages:
+  - security-scan     # Escaneo de secretos y dependencias
+  - test              # Pruebas unitarias y de integración
+  - build             # Construcción de código y imagen Docker
+  - vulnerability     # Análisis de vulnerabilidades
+  - quality           # Análisis de calidad de código
+  - approval          # Aprobaciones manuales
+  - deploy            # Despliegue a GKE
+  - post-deploy       # Verificaciones post-despliegue
+  - rollback          # Rollback manual
+
+# Templates incluidos según la rama
+include:
+  - local: '.gitlab/ci/develop-pipeline.yml'
+    rules:
+      - if: '$CI_COMMIT_BRANCH == "develop"'
+  
+  - local: '.gitlab/ci/release-pipeline.yml'
+    rules:
+      - if: '$CI_COMMIT_BRANCH == "release"'
+  
+  - local: '.gitlab/ci/main-pipeline.yml'
+    rules:
+      - if: '$CI_COMMIT_BRANCH == "main"'
+  
+  - local: '.gitlab/templates/security.yml'
+  - local: '.gitlab/templates/build.yml'
+  - local: '.gitlab/templates/deploy.yml'
+
+# Cache configuration
+cache:
+  key: ${CI_COMMIT_REF_SLUG}
+  paths:
+    - node_modules/
+    - .m2/repository/
+    - .gradle/
+    - vendor/
+
+# Configuración de retry para jobs
+default:
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+  tags:
+    - docker
+    - gcp
+
+# ============================================================================
+# JOBS COMUNES (SE EJECUTAN EN TODAS LAS RAMAS)
+# ============================================================================
+
+# Job: Secret Scanning
+secret-scanning:
+  stage: security-scan
+  image: trufflesecurity/trufflehog:latest
+  script:
+    - echo " Escaneando secretos en el código..."
+    - trufflehog filesystem . --json --fail > trufflehog-report.json || true
+    - |
+      if grep -q '"verified": true' trufflehog-report.json; then
+        echo " SECRETOS DETECTADOS Y VERIFICADOS!"
+        exit 1
+      fi
+    - echo " No se encontraron secretos expuestos"
+  artifacts:
+    reports:
+      sast: trufflehog-report.json
+    paths:
+      - trufflehog-report.json
+    expire_in: 30 days
+  allow_failure: false
+
+# Job: Dependency Check
+dependency-check:
+  stage: security-scan
+  image: owasp/dependency-check:latest
+  script:
+    - echo " Analizando dependencias..."
+    - /usr/share/dependency-check/bin/dependency-check.sh 
+      --scan . 
+      --format JSON 
+      --out dependency-check-report.json
+      --enableExperimental
+    - echo " Análisis de dependencias completado"
+  artifacts:
+    paths:
+      - dependency-check-report.json
+    expire_in: 30 days
+  allow_failure: true
+
+# Job: Unit Tests (ejemplo para Node.js)
+unit-tests:
+  stage: test
+  image: node:18-alpine
+  before_script:
+    - npm ci
+  script:
+    - echo " Ejecutando pruebas unitarias..."
+    - npm run test:unit -- --coverage
+    - echo " Pruebas unitarias completadas"
+  coverage: '/All files[^|]*\|[^|]*\s+([\d\.]+)/'
+  artifacts:
+    reports:
+      junit: junit.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml
+    paths:
+      - coverage/
+    expire_in: 30 days
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "release"'
+
+# Job: Build Docker Image
+build-image:
+  stage: build
+  image: docker:24-dind
+  services:
+    - docker:24-dind
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+  script:
+    - echo " Construyendo imagen Docker..."
+    - |
+      # Determinar el tag según la rama
+      if [ "$CI_COMMIT_BRANCH" == "main" ]; then
+        TAGS="-t $IMAGE_NAME:$CI_COMMIT_TAG -t $IMAGE_NAME:latest"
+      elif [ "$CI_COMMIT_BRANCH" == "release" ]; then
+        TAGS="-t $IMAGE_NAME:release-$IMAGE_TAG -t $IMAGE_NAME:release-latest"
+      else
+        TAGS="-t $IMAGE_NAME:dev-$IMAGE_TAG"
+      fi
+    - docker build $TAGS --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') 
+      --build-arg VCS_REF=$CI_COMMIT_SHA 
+      --build-arg VERSION=$CI_COMMIT_TAG 
+      -f docker/Dockerfile .
+    - docker push $IMAGE_NAME --all-tags
+    - echo " Imagen construida y subida al registry"
+  artifacts:
+    reports:
+      dotenv: build.env
+
+# Job: Vulnerability Scan with Trivy
+vulnerability-scan:
+  stage: vulnerability
+  image: aquasec/trivy:${TRIVY_VERSION}
+  variables:
+    TRIVY_NO_PROGRESS: "true"
+    TRIVY_CACHE_DIR: ".trivycache/"
+  script:
+    - echo " Escaneando vulnerabilidades con Trivy..."
+    - |
+      # Determinar la imagen a escanear según la rama
+      if [ "$CI_COMMIT_BRANCH" == "main" ]; then
+        SCAN_IMAGE="$IMAGE_NAME:latest"
+      elif [ "$CI_COMMIT_BRANCH" == "release" ]; then
+        SCAN_IMAGE="$IMAGE_NAME:release-latest"
+      else
+        SCAN_IMAGE="$IMAGE_NAME:dev-$IMAGE_TAG"
+      fi
+    - trivy image 
+      --severity HIGH,CRITICAL 
+      --exit-code 0 
+      --format json 
+      --output trivy-report.json 
+      $SCAN_IMAGE
+    - trivy image 
+      --severity CRITICAL 
+      --exit-code 1 
+      $SCAN_IMAGE
+    - echo " Escaneo de vulnerabilidades completado"
+  artifacts:
+    reports:
+      container_scanning: trivy-report.json
+    paths:
+      - trivy-report.json
+    expire_in: 30 days
+  cache:
+    paths:
+      - .trivycache/
+  allow_failure: false
+  dependencies:
+    - build-image
+
+# Job: Code Quality Analysis (SonarQube)
+code-quality:
+  stage: quality
+  image: sonarsource/sonar-scanner-cli:${SONAR_VERSION}
+  script:
+    - echo " Analizando calidad de código..."
+    - sonar-scanner 
+      -Dsonar.projectKey=$CI_PROJECT_NAME 
+      -Dsonar.sources=. 
+      -Dsonar.host.url=$SONAR_HOST_URL 
+      -Dsonar.login=$SONAR_TOKEN
+    - echo " Análisis de calidad completado"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "release" || $CI_COMMIT_BRANCH == "main"'
+  allow_failure: true
+
+# ============================================================================
+# NOTIFICACIONES
+# ============================================================================
+
+# Job: Notificar éxito
+notify-success:
+  stage: post-deploy
+  image: curlimages/curl:latest
+  script:
+    - |
+      curl -X POST $SLACK_WEBHOOK_URL \
+        -H 'Content-Type: application/json' \
+        -d "{
+          \"text\": \" Despliegue exitoso en $CI_COMMIT_BRANCH\",
+          \"blocks\": [
+            {
+              \"type\": \"section\",
+              \"text\": {
+                \"type\": \"mrkdwn\",
+                \"text\": \"*Pipeline exitoso*\n*Rama:* $CI_COMMIT_BRANCH\n*Commit:* $CI_COMMIT_SHORT_SHA\n*Autor:* $GITLAB_USER_NAME\"
+              }
+            }
+          ]
+        }"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "release"'
+      when: on_success
+  allow_failure: true
+
+# Job: Notificar fallo
+notify-failure:
+  stage: post-deploy
+  image: curlimages/curl:latest
+  script:
+    - |
+      curl -X POST $SLACK_WEBHOOK_URL \
+        -H 'Content-Type: application/json' \
+        -d "{
+          \"text\": \" Pipeline fallido en $CI_COMMIT_BRANCH\",
+          \"blocks\": [
+            {
+              \"type\": \"section\",
+              \"text\": {
+                \"type\": \"mrkdwn\",
+                \"text\": \"*Pipeline fallido*\n*Rama:* $CI_COMMIT_BRANCH\n*Commit:* $CI_COMMIT_SHORT_SHA\n*Autor:* $GITLAB_USER_NAME\n*URL:* $CI_PIPELINE_URL\"
+              }
+            }
+          ]
+        }"
+  when: on_failure
+  allow_failure: true

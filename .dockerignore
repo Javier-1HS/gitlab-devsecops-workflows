@@ -1,0 +1,62 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# CI/CD
+.gitlab-ci.yml
+.github/
+.gitlab/
+.circleci/
+
+# Dependencies
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Build artifacts
+dist/
+build/
+.tsc-out/
+
+# Test files
+__tests__/
+tests/
+coverage/
+.nyc_output/
+cypress/
+jest.config.js
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-project
+*.sublime-workspace
+.DS_Store
+
+# Documentation
+docs/
+README.md
+CONTRIBUTING.md
+LICENSE
+
+# Configuration examples
+.env.example
+.env.local
+.env.*.local
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Temp files
+*.tmp
+*.log
+.tmp/
+
+# OS
+Thumbs.db
+.DS_Store

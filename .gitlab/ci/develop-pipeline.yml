@@ -1,0 +1,166 @@
+# Pipeline para rama DEVELOP
+# Despliegue automático a ambiente de Development en GKE
+
+# ============================================================================
+# JOBS ESPECÍFICOS PARA DEVELOP
+# ============================================================================
+
+# Job: Deploy to Development
+deploy-to-dev:
+  stage: deploy
+  image: google/cloud-sdk:alpine
+  before_script:
+    - echo "$GCP_SERVICE_ACCOUNT_KEY" | base64 -d > ${HOME}/gcp-key.json
+    - gcloud auth activate-service-account --key-file ${HOME}/gcp-key.json
+    - gcloud config set project $GCP_PROJECT_ID
+    - gcloud container clusters get-credentials $GKE_CLUSTER_DEV --region $GCP_REGION
+    - kubectl version --client
+  script:
+    - echo " Desplegando a ambiente Development..."
+    
+    # Crear namespace si no existe
+    - kubectl create namespace $K8S_NAMESPACE_DEV --dry-run=client -o yaml | kubectl apply -f -
+    
+    # Configurar imagen en deployment
+    - export IMAGE_FULL="$IMAGE_NAME:dev-$IMAGE_TAG"
+    
+    # Aplicar manifiestos de Kubernetes
+    - |
+      cat infrastructure/kubernetes/apps/dev/deployment.yaml | \
+      sed "s|IMAGE_PLACEHOLDER|$IMAGE_FULL|g" | \
+      sed "s|NAMESPACE_PLACEHOLDER|$K8S_NAMESPACE_DEV|g" | \
+      kubectl apply -f -
+    
+    - kubectl apply -f infrastructure/kubernetes/apps/dev/service.yaml -n $K8S_NAMESPACE_DEV
+    - kubectl apply -f infrastructure/kubernetes/apps/dev/configmap.yaml -n $K8S_NAMESPACE_DEV
+    
+    # Esperar a que el despliegue se complete
+    - kubectl rollout status deployment/${CI_PROJECT_NAME} -n $K8S_NAMESPACE_DEV --timeout=5m
+    
+    - echo " Despliegue a Development completado"
+    
+    # Obtener URL del servicio
+    - |
+      SERVICE_URL=$(kubectl get svc ${CI_PROJECT_NAME} -n $K8S_NAMESPACE_DEV -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+      echo " Aplicación disponible en: http://$SERVICE_URL"
+      echo "SERVICE_URL=$SERVICE_URL" >> deploy.env
+  environment:
+    name: development
+    url: http://$SERVICE_URL
+    on_stop: stop-dev
+    auto_stop_in: 1 week
+  artifacts:
+    reports:
+      dotenv: deploy.env
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+  dependencies:
+    - build-image
+    - vulnerability-scan
+
+# Job: Health Check Development
+healthcheck-dev:
+  stage: post-deploy
+  image: curlimages/curl:latest
+  script:
+    - echo " Verificando salud de la aplicación en DEV..."
+    - sleep 30  # Dar tiempo para que la app arranque
+    - |
+      for i in {1..10}; do
+        if curl -f -s http://${SERVICE_URL}/health > /dev/null; then
+          echo " Aplicación respondiendo correctamente"
+          exit 0
+        fi
+        echo " Intento $i/10 - esperando..."
+        sleep 10
+      done
+      echo " La aplicación no responde después de 10 intentos"
+      exit 1
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+  dependencies:
+    - deploy-to-dev
+  allow_failure: false
+
+# Job: Integration Tests en DEV
+integration-tests-dev:
+  stage: post-deploy
+  image: node:18-alpine
+  before_script:
+    - npm ci
+  script:
+    - echo " Ejecutando pruebas de integración en DEV..."
+    - export API_URL="http://${SERVICE_URL}"
+    - npm run test:integration
+    - echo " Pruebas de integración completadas"
+  artifacts:
+    reports:
+      junit: integration-test-results.xml
+    paths:
+      - integration-test-results/
+    expire_in: 7 days
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+  dependencies:
+    - deploy-to-dev
+  allow_failure: true
+
+# Job: Performance Tests en DEV
+performance-tests-dev:
+  stage: post-deploy
+  image: grafana/k6:latest
+  script:
+    - echo " Ejecutando pruebas de rendimiento en DEV..."
+    - k6 run --out json=performance-results.json scripts/performance/load-test.js
+    - echo " Pruebas de rendimiento completadas"
+  artifacts:
+    paths:
+      - performance-results.json
+    expire_in: 7 days
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+  dependencies:
+    - deploy-to-dev
+  allow_failure: true
+
+# Job: Stop Development Environment (manual)
+stop-dev:
+  stage: deploy
+  image: google/cloud-sdk:alpine
+  before_script:
+    - echo "$GCP_SERVICE_ACCOUNT_KEY" | base64 -d > ${HOME}/gcp-key.json
+    - gcloud auth activate-service-account --key-file ${HOME}/gcp-key.json
+    - gcloud config set project $GCP_PROJECT_ID
+    - gcloud container clusters get-credentials $GKE_CLUSTER_DEV --region $GCP_REGION
+  script:
+    - echo " Deteniendo ambiente Development..."
+    - kubectl delete deployment ${CI_PROJECT_NAME} -n $K8S_NAMESPACE_DEV --ignore-not-found=true
+    - kubectl delete service ${CI_PROJECT_NAME} -n $K8S_NAMESPACE_DEV --ignore-not-found=true
+    - echo " Ambiente Development detenido"
+  environment:
+    name: development
+    action: stop
+  when: manual
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+
+# Job: Rollback Development (manual)
+rollback-dev:
+  stage: rollback
+  image: google/cloud-sdk:alpine
+  before_script:
+    - echo "$GCP_SERVICE_ACCOUNT_KEY" | base64 -d > ${HOME}/gcp-key.json
+    - gcloud auth activate-service-account --key-file ${HOME}/gcp-key.json
+    - gcloud config set project $GCP_PROJECT_ID
+    - gcloud container clusters get-credentials $GKE_CLUSTER_DEV --region $GCP_REGION
+  script:
+    - echo " Realizando rollback en Development..."
+    - kubectl rollout undo deployment/${CI_PROJECT_NAME} -n $K8S_NAMESPACE_DEV
+    - kubectl rollout status deployment/${CI_PROJECT_NAME} -n $K8S_NAMESPACE_DEV --timeout=3m
+    - echo " Rollback completado"
+  environment:
+    name: development
+    action: rollback
+  when: manual
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'

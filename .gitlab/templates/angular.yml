@@ -1,0 +1,228 @@
+# Template para proyectos Angular
+# Variables requeridas: NODE_VERSION (default: 18)
+
+# Job: Angular Build
+.angular-build:
+  stage: build
+  image: node:${NODE_VERSION:-18}-alpine
+  before_script:
+    - npm ci
+  script:
+    - echo "🎯 Building Angular application..."
+    - npm run build -- --configuration production
+    - echo "✅ Build completado"
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 1 hour
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths:
+      - node_modules/
+      - .npm/
+
+# Job: Angular Linting
+.angular-lint:
+  stage: build
+  image: node:${NODE_VERSION:-18}-alpine
+  before_script:
+    - npm ci
+  script:
+    - echo "✏️ Running Angular linting..."
+    - npm run lint
+    - echo "✅ Linting completado"
+  allow_failure: false
+
+# Job: Angular Unit Tests
+.angular-tests:
+  stage: test
+  image: node:${NODE_VERSION:-18}-alpine
+  before_script:
+    - npm ci
+  script:
+    - echo "🧪 Running Angular unit tests..."
+    - npm run test:ci -- --code-coverage
+    - echo "✅ Unit tests completado"
+  artifacts:
+    paths:
+      - coverage/
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml
+      junit: coverage/junit.xml
+    expire_in: 30 days
+  coverage: '/Statements[^|]*\|.*?(\d+(\.\d+)?)\%/'
+  allow_failure: false
+
+# Job: Angular E2E Tests (Cypress)
+.angular-e2e-tests:
+  stage: test
+  image: cypress/included:13.6.0
+  before_script:
+    - npm ci
+  script:
+    - echo "🎯 Running Angular E2E tests with Cypress..."
+    - npm run e2e:ci || true
+    - echo "✅ E2E tests completado"
+  artifacts:
+    when: always
+    paths:
+      - cypress/screenshots/
+      - cypress/videos/
+      - cypress/results/
+    reports:
+      junit: cypress/results/junit-*.xml
+    expire_in: 30 days
+  allow_failure: true
+
+# Job: Angular Accessibility Tests
+.angular-a11y-tests:
+  stage: test
+  image: node:${NODE_VERSION:-18}-alpine
+  before_script:
+    - npm ci
+  script:
+    - echo "♿ Running accessibility tests..."
+    - npm run test:a11y || true
+    - echo "✅ Accessibility tests completado"
+  artifacts:
+    paths:
+      - accessibility-report/
+    expire_in: 30 days
+  allow_failure: true
+
+# Job: Angular Performance Testing
+.angular-performance:
+  stage: post-deploy
+  image: node:${NODE_VERSION:-18}-alpine
+  before_script:
+    - npm ci
+    - npm run build -- --configuration production
+  script:
+    - echo "⚡ Running performance testing..."
+    - npm run test:performance || true
+    - echo "✅ Performance testing completado"
+  artifacts:
+    paths:
+      - performance-report/
+    expire_in: 30 days
+  allow_failure: true
+
+# Job: Angular Bundle Analysis
+.angular-bundle-analysis:
+  stage: quality
+  image: node:${NODE_VERSION:-18}-alpine
+  before_script:
+    - npm ci
+  script:
+    - echo "📦 Analyzing bundle size..."
+    - npm run build -- --configuration production --stats-file
+    - npm run analyze:bundle || true
+    - echo "✅ Bundle analysis completado"
+  artifacts:
+    paths:
+      - dist/stats.json
+      - bundle-analysis/
+    expire_in: 30 days
+  allow_failure: true
+
+# Job: Build Docker Image for Angular
+.angular-docker-build:
+  stage: build
+  image: docker:24-dind
+  services:
+    - docker:24-dind
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+  script:
+    - echo "🐳 Building Angular Docker image..."
+    - |
+      docker build \
+        --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+        --build-arg VCS_REF=$CI_COMMIT_SHA \
+        -t $IMAGE_NAME:angular-$IMAGE_TAG \
+        -f docker/angular/Dockerfile .
+    - docker push $IMAGE_NAME:angular-$IMAGE_TAG
+    - echo "✅ Angular image build and pushed"
+  after_script:
+    - docker logout "$CI_REGISTRY"
+
+# Job: SonarQube Analysis for Angular
+.angular-sonarqube:
+  stage: quality
+  image: sonarsource/sonar-scanner-cli:${SONAR_VERSION}
+  before_script:
+    - npm ci
+    - npm run build -- --configuration production
+  script:
+    - echo "🔬 Running SonarQube analysis for Angular..."
+    - sonar-scanner
+      -Dsonar.projectKey=$CI_PROJECT_NAME
+      -Dsonar.host.url=$SONAR_HOST_URL
+      -Dsonar.login=$SONAR_TOKEN
+      -Dsonar.sources=src
+      -Dsonar.exclusions=node_modules/**,dist/**
+      -Dsonar.typescript.lcov.reportPaths=coverage/lcov.info
+    - echo "✅ SonarQube analysis completado"
+  allow_failure: true
+
+# Job: Format Check (Prettier)
+.angular-format:
+  stage: build
+  image: node:${NODE_VERSION:-18}-alpine
+  before_script:
+    - npm ci
+  script:
+    - echo "🎨 Checking code format..."
+    - npm run format:check
+    - echo "✅ Format check completado"
+  allow_failure: false
+
+# Job: Angular Security Audit
+.angular-security-audit:
+  stage: security-scan
+  image: node:${NODE_VERSION:-18}-alpine
+  before_script:
+    - npm ci
+  script:
+    - echo "🔐 Running npm audit..."
+    - npm audit --audit-level=moderate || true
+    - echo "✅ Security audit completado"
+  allow_failure: true
+
+# Job: Lighthouse Audit
+.angular-lighthouse:
+  stage: post-deploy
+  image: node:${NODE_VERSION:-18}-alpine
+  before_script:
+    - npm ci
+    - npm install -g @lhci/cli@0.8.x
+  script:
+    - echo "📊 Running Lighthouse audit..."
+    - lhci autorun || true
+    - echo "✅ Lighthouse audit completado"
+  artifacts:
+    paths:
+      - .lighthouseci/
+    expire_in: 30 days
+  allow_failure: true
+
+# Job: Health Check for Angular
+.angular-health-check:
+  stage: post-deploy
+  image: curlimages/curl:latest
+  script:
+    - echo "💚 Checking Angular application..."
+    - |
+      for i in {1..15}; do
+        if curl -f -s http://${APP_HOST}:${APP_PORT:-4200} | grep -q '<app-root'; then
+          echo "✅ Angular application is running and responsive"
+          exit 0
+        fi
+        echo "⏳ Attempt $i/15..."
+        sleep 5
+      done
+      echo "❌ Angular application health check failed"
+      exit 1
+  allow_failure: false

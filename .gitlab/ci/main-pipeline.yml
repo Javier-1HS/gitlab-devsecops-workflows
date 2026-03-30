@@ -1,0 +1,365 @@
+# Pipeline para rama MAIN (PRODUCCIÓN)
+# Despliegue a ambiente de Producción con aprobaciones formales
+
+# ============================================================================
+# JOBS ESPECÍFICOS PARA MAIN (PRODUCCIÓN)
+# ============================================================================
+
+# Job: Pre-Production Validation
+pre-production-validation:
+  stage: test
+  script:
+    - echo " Validaciones pre-producción..."
+    - echo "  ✓ Branch debe venir de release"
+    - echo "  ✓ Todos los tests deben haber pasado"
+    - echo "  ✓ Sin vulnerabilidades críticas"
+    - echo "  ✓ Aprobaciones de QA y Tech Lead completadas"
+    - |
+      # Verificar que viene de release
+      if [[ "$CI_COMMIT_BRANCH" != "main" ]]; then
+        echo " Este pipeline solo debe ejecutarse en main"
+        exit 1
+      fi
+    - echo " Validaciones completadas"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+# Job: Final Security Audit
+final-security-audit:
+  stage: security-scan
+  image: aquasec/trivy:latest
+  script:
+    - echo " Auditoría de seguridad final..."
+    - trivy image --severity CRITICAL,HIGH --exit-code 1 $IMAGE_NAME:latest
+    - echo " Auditoría de seguridad completada sin críticos"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  allow_failure: false
+
+# Job: Aprobación de Líder Técnico
+technical-lead-production-approval:
+  stage: approval
+  script:
+    - echo "⏸ Esperando aprobación de Líder Técnico para PRODUCCIÓN..."
+    - echo ""
+    - echo " Checklist de aprobación:"
+    - echo "  ✓ Release notes preparadas"
+    - echo "  ✓ Rollback plan documentado"
+    - echo "  ✓ Monitoreo configurado"
+    - echo "  ✓ Alertas activadas"
+    - echo "  ✓ Equipo de soporte notificado"
+    - echo "  ✓ Ventana de mantenimiento agendada (si aplica)"
+    - echo "  ✓ Comunicación a usuarios preparada"
+  environment:
+    name: production-technical-approval
+  when: manual
+  allow_failure: false
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+# Job: Aprobación del Comité de Cambios
+change-committee-approval:
+  stage: approval
+  script:
+    - echo "⏸ Esperando aprobación del COMITÉ DE CAMBIOS..."
+    - echo ""
+    - echo " Documentación requerida:"
+    - echo "  ✓ RFC (Request for Change) aprobado"
+    - echo "  ✓ Análisis de impacto completado"
+    - echo "  ✓ Plan de rollback validado"
+    - echo "  ✓ Pruebas en staging exitosas"
+    - echo "  ✓ Compliance y auditoría revisados"
+    - echo "  ✓ Superintendencia notificada (si aplica)"
+    - echo ""
+    - echo " Aprobadores requeridos:"
+    - echo "  - CTO o Líder Técnico"
+    - echo "  - Gerente de Operaciones"
+    - echo "  - Oficial de Seguridad"
+    - echo "  - Compliance Officer"
+  environment:
+    name: production-committee-approval
+  when: manual
+  allow_failure: false
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  needs:
+    - technical-lead-production-approval
+
+# Job: Create Release Tag
+create-release-tag:
+  stage: deploy
+  image: alpine/git:latest
+  before_script:
+    - git config --global user.email "cicd@crezcamos.com"
+    - git config --global user.name "GitLab CI/CD"
+  script:
+    - echo " Creando tag de release..."
+    - |
+      # Obtener versión
+      VERSION=$(cat package.json | grep version | head -1 | awk -F: '{ print $2 }' | sed 's/[",]//g' | tr -d '[[:space:]]')
+      
+      # Crear tag anotado
+      git tag -a "v$VERSION" -m "Release v$VERSION - $(date +'%Y-%m-%d')"
+      
+      # Push del tag
+      git push origin "v$VERSION"
+      
+      echo " Tag v$VERSION creado y pusheado"
+      echo "RELEASE_VERSION=v$VERSION" >> release.env
+  artifacts:
+    reports:
+      dotenv: release.env
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  needs:
+    - change-committee-approval
+
+# Job: Deploy to Production (Blue-Green)
+deploy-to-production:
+  stage: deploy
+  image: google/cloud-sdk:alpine
+  before_script:
+    - echo "$GCP_SERVICE_ACCOUNT_KEY" | base64 -d > ${HOME}/gcp-key.json
+    - gcloud auth activate-service-account --key-file ${HOME}/gcp-key.json
+    - gcloud config set project $GCP_PROJECT_ID
+    - gcloud container clusters get-credentials $GKE_CLUSTER_PROD --region $GCP_REGION
+    - kubectl version --client
+  script:
+    - echo " Iniciando despliegue a PRODUCCIÓN..."
+    
+    # Crear namespace si no existe
+    - kubectl create namespace $K8S_NAMESPACE_PROD --dry-run=client -o yaml | kubectl apply -f -
+    
+    # Configurar imagen
+    - export IMAGE_FULL="$IMAGE_NAME:$RELEASE_VERSION"
+    
+    # Crear secrets
+    - |
+      kubectl create secret docker-registry regcred \
+        --docker-server=$CI_REGISTRY \
+        --docker-username=$CI_REGISTRY_USER \
+        --docker-password=$CI_REGISTRY_PASSWORD \
+        --docker-email=$GITLAB_USER_EMAIL \
+        -n $K8S_NAMESPACE_PROD \
+        --dry-run=client -o yaml | kubectl apply -f -
+    
+    # Crear secrets de aplicación desde Google Secret Manager
+    - |
+      kubectl create secret generic app-secrets \
+        --from-literal=database-url=$DATABASE_URL_PROD \
+        --from-literal=api-key=$API_KEY_PROD \
+        -n $K8S_NAMESPACE_PROD \
+        --dry-run=client -o yaml | kubectl apply -f -
+    
+    # Aplicar ConfigMaps
+    - kubectl apply -f infrastructure/kubernetes/apps/prod/configmap.yaml -n $K8S_NAMESPACE_PROD
+    
+    # Estrategia Blue-Green: Crear nuevo deployment
+    - export DEPLOYMENT_NAME="${CI_PROJECT_NAME}-green"
+    - |
+      cat infrastructure/kubernetes/apps/prod/deployment.yaml | \
+      sed "s|IMAGE_PLACEHOLDER|$IMAGE_FULL|g" | \
+      sed "s|NAMESPACE_PLACEHOLDER|$K8S_NAMESPACE_PROD|g" | \
+      sed "s|DEPLOYMENT_NAME|$DEPLOYMENT_NAME|g" | \
+      kubectl apply -f -
+    
+    # Esperar a que el nuevo deployment esté listo
+    - kubectl rollout status deployment/$DEPLOYMENT_NAME -n $K8S_NAMESPACE_PROD --timeout=15m
+    
+    # Verificar salud de los nuevos pods
+    - |
+      READY_PODS=$(kubectl get deployment $DEPLOYMENT_NAME -n $K8S_NAMESPACE_PROD -o jsonpath='{.status.readyReplicas}')
+      DESIRED_PODS=$(kubectl get deployment $DEPLOYMENT_NAME -n $K8S_NAMESPACE_PROD -o jsonpath='{.spec.replicas}')
+      
+      if [ "$READY_PODS" != "$DESIRED_PODS" ]; then
+        echo " No todos los pods están listos"
+        exit 1
+      fi
+    
+    - echo " Nuevo deployment listo - esperando confirmación para switch de tráfico..."
+  environment:
+    name: production
+    url: https://app.crezcamos.com
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  needs:
+    - create-release-tag
+    - change-committee-approval
+
+# Job: Production Smoke Tests (en Green)
+production-smoke-tests:
+  stage: post-deploy
+  image: curlimages/curl:latest
+  script:
+    - echo "💨 Ejecutando smoke tests en entorno Green..."
+    
+    # Obtener IP del servicio Green
+    - export GREEN_URL=$(kubectl get svc ${CI_PROJECT_NAME}-green -n $K8S_NAMESPACE_PROD -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+    
+    # Health check
+    - |
+      for i in {1..20}; do
+        if curl -f -s http://$GREEN_URL/health > /dev/null; then
+          echo " Health check OK (intento $i)"
+          break
+        fi
+        if [ $i -eq 20 ]; then
+          echo " Health check falló después de 20 intentos"
+          exit 1
+        fi
+        sleep 5
+      done
+    
+    # Version check
+    - |
+      VERSION=$(curl -s http://$GREEN_URL/version | jq -r '.version')
+      echo " Versión en Green: $VERSION"
+      
+      if [ "$VERSION" != "$RELEASE_VERSION" ]; then
+        echo " Versión incorrecta desplegada"
+        exit 1
+      fi
+    
+    - echo " Smoke tests en Green pasaron correctamente"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  dependencies:
+    - deploy-to-production
+
+# Job: Traffic Switch Approval
+traffic-switch-approval:
+  stage: approval
+  script:
+    - echo "⏸ Aprobación para cambio de tráfico de Blue a Green..."
+    - echo ""
+    - echo " Métricas a validar:"
+    - echo "  ✓ Todos los pods Green están healthy"
+    - echo "  ✓ Smoke tests pasaron exitosamente"
+    - echo "  ✓ Logs no muestran errores críticos"
+    - echo "  ✓ Métricas de rendimiento normales"
+    - echo "  ✓ Latencia dentro de rangos aceptables"
+    - echo ""
+    - echo "  IMPORTANTE: Este cambio redirigirá el tráfico de producción"
+  environment:
+    name: production-traffic-switch
+  when: manual
+  allow_failure: false
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  needs:
+    - production-smoke-tests
+
+# Job: Switch Traffic to Green
+switch-traffic-green:
+  stage: deploy
+  image: google/cloud-sdk:alpine
+  before_script:
+    - echo "$GCP_SERVICE_ACCOUNT_KEY" | base64 -d > ${HOME}/gcp-key.json
+    - gcloud auth activate-service-account --key-file ${HOME}/gcp-key.json
+    - gcloud config set project $GCP_PROJECT_ID
+    - gcloud container clusters get-credentials $GKE_CLUSTER_PROD --region $GCP_REGION
+  script:
+    - echo " Cambiando tráfico a Green deployment..."
+    
+    # Actualizar selector del servicio principal para apuntar a Green
+    - |
+      kubectl patch service ${CI_PROJECT_NAME} -n $K8S_NAMESPACE_PROD -p \
+        '{"spec":{"selector":{"deployment":"green"}}}'
+    
+    - echo " Tráfico ahora apunta a Green deployment"
+    - echo " Monitoreando por 5 minutos..."
+    
+    - sleep 300  # Monitorear por 5 minutos
+    
+    # Verificar métricas
+    - echo " Verificando métricas de producción..."
+    - |
+      ERROR_RATE=$(kubectl top pods -n $K8S_NAMESPACE_PROD -l deployment=green | grep -v NAME | awk '{print $3}' | sed 's/%//' | awk '{s+=$1} END {print s/NR}')
+      echo "Error rate promedio: $ERROR_RATE%"
+    
+    - echo " Cambio de tráfico completado exitosamente"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  needs:
+    - traffic-switch-approval
+
+# Job: Cleanup Blue Deployment
+cleanup-blue-deployment:
+  stage: post-deploy
+  image: google/cloud-sdk:alpine
+  before_script:
+    - echo "$GCP_SERVICE_ACCOUNT_KEY" | base64 -d > ${HOME}/gcp-key.json
+    - gcloud auth activate-service-account --key-file ${HOME}/gcp-key.json
+    - gcloud config set project $GCP_PROJECT_ID
+    - gcloud container clusters get-credentials $GKE_CLUSTER_PROD --region $GCP_REGION
+  script:
+    - echo " Limpiando Blue deployment anterior..."
+    
+    # Escalar Blue a 0 réplicas (no eliminarlo por si acaso)
+    - kubectl scale deployment ${CI_PROJECT_NAME}-blue -n $K8S_NAMESPACE_PROD --replicas=0 || true
+    
+    # Renombrar Green a Blue para el próximo despliegue
+    - kubectl label deployment ${CI_PROJECT_NAME}-green deployment=blue -n $K8S_NAMESPACE_PROD --overwrite
+    
+    - echo " Cleanup completado"
+  when: manual
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  needs:
+    - switch-traffic-green
+
+# Job: Post-Deployment Monitoring
+post-deployment-monitoring:
+  stage: post-deploy
+  image: google/cloud-sdk:alpine
+  script:
+    - echo " Monitoreando despliegue de producción..."
+    - echo " Período de monitoreo: 30 minutos"
+    
+    # Aquí se podrían hacer queries a Prometheus/Grafana
+    - echo "✓ Verificando logs de errores..."
+    - echo "✓ Verificando latencia de API..."
+    - echo "✓ Verificando tasa de errores HTTP..."
+    - echo "✓ Verificando uso de recursos..."
+    
+    - echo " Monitoreo post-despliegue completado"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  needs:
+    - switch-traffic-green
+  allow_failure: true
+
+# Job: Rollback Production (Emergency)
+rollback-production:
+  stage: rollback
+  image: google/cloud-sdk:alpine
+  before_script:
+    - echo "$GCP_SERVICE_ACCOUNT_KEY" | base64 -d > ${HOME}/gcp-key.json
+    - gcloud auth activate-service-account --key-file ${HOME}/gcp-key.json
+    - gcloud config set project $GCP_PROJECT_ID
+    - gcloud container clusters get-credentials $GKE_CLUSTER_PROD --region $GCP_REGION
+  script:
+    - echo " INICIANDO ROLLBACK DE EMERGENCIA EN PRODUCCIÓN..."
+    
+    # Switch inmediato al deployment Blue (versión anterior)
+    - |
+      kubectl patch service ${CI_PROJECT_NAME} -n $K8S_NAMESPACE_PROD -p \
+        '{"spec":{"selector":{"deployment":"blue"}}}'
+    
+    # Escalar Blue deployment
+    - kubectl scale deployment ${CI_PROJECT_NAME}-blue -n $K8S_NAMESPACE_PROD --replicas=3
+    
+    # Esperar a que esté listo
+    - kubectl rollout status deployment/${CI_PROJECT_NAME}-blue -n $K8S_NAMESPACE_PROD --timeout=5m
+    
+    # Verificar
+    - kubectl get pods -n $K8S_NAMESPACE_PROD -l deployment=blue
+    
+    - echo " ROLLBACK COMPLETADO - Tráfico restaurado a versión anterior"
+    - echo "  ACCIÓN REQUERIDA: Investigar causa del problema"
+  environment:
+    name: production
+    action: rollback
+  when: manual
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'

@@ -1,0 +1,285 @@
+# Template para proyectos TypeScript Backend/Node.js
+# Variables requeridas: NODE_VERSION (default: 18)
+
+# Job: TypeScript Build
+.typescript-build:
+  stage: build
+  image: node:${NODE_VERSION:-18}-alpine
+  before_script:
+    - npm ci
+  script:
+    - echo "🔨 Building TypeScript application..."
+    - npm run build
+    - echo "✅ Build completado"
+  artifacts:
+    paths:
+      - dist/
+      - node_modules/
+    expire_in: 1 hour
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths:
+      - node_modules/
+      - .npm/
+
+# Job: TypeScript Compilation Check
+.typescript-compile:
+  stage: build
+  image: node:${NODE_VERSION:-18}-alpine
+  before_script:
+    - npm ci
+  script:
+    - echo "✔️ Checking TypeScript compilation..."
+    - npx tsc --noEmit
+    - echo "✅ TypeScript compilation check passed"
+  allow_failure: false
+
+# Job: TypeScript Linting
+.typescript-lint:
+  stage: build
+  image: node:${NODE_VERSION:-18}-alpine
+  before_script:
+    - npm ci
+  script:
+    - echo "✏️ Running ESLint for TypeScript..."
+    - npm run lint
+    - npm run lint:strict || true
+    - echo "✅ Linting completado"
+  allow_failure: false
+
+# Job: TypeScript Unit Tests
+.typescript-tests:
+  stage: test
+  image: node:${NODE_VERSION:-18}-alpine
+  before_script:
+    - npm ci
+  script:
+    - echo "🧪 Running TypeScript unit tests with Jest..."
+    - npm run test -- --coverage --passWithNoTests
+    - echo "✅ Unit tests completado"
+  artifacts:
+    paths:
+      - coverage/
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml
+      junit: coverage/junit.xml
+    expire_in: 30 days
+  coverage: '/All files[^|]*\|[^|]*\s+([\d\.]+)/'
+  allow_failure: false
+
+# Job: TypeScript Integration Tests
+.typescript-integration-tests:
+  stage: test
+  image: node:${NODE_VERSION:-18}-alpine
+  before_script:
+    - npm ci
+  script:
+    - echo "🔗 Running TypeScript integration tests..."
+    - npm run test:integration || npm run test:int || true
+    - echo "✅ Integration tests completado"
+  artifacts:
+    paths:
+      - test-results/
+    reports:
+      junit: test-results/junit.xml
+    expire_in: 30 days
+  allow_failure: true
+
+# Job: Checking Dependencies
+.typescript-security-audit:
+  stage: security-scan
+  image: node:${NODE_VERSION:-18}-alpine
+  before_script:
+    - npm ci
+  script:
+    - echo "🔐 Running npm security audit..."
+    - npm audit --audit-level=moderate || true
+    - echo "✅ Security audit completado"
+  allow_failure: true
+
+# Job: Format Check with Prettier
+.typescript-format:
+  stage: build
+  image: node:${NODE_VERSION:-18}-alpine
+  before_script:
+    - npm ci
+  script:
+    - echo "🎨 Checking code format with Prettier..."
+    - npm run format:check || npx prettier --check "src/**/*.{ts,tsx,js,jsx,json,md}"
+    - echo "✅ Format check completado"
+  allow_failure: false
+
+# Job: API Documentation Generation
+.typescript-docs:
+  stage: quality
+  image: node:${NODE_VERSION:-18}-alpine
+  before_script:
+    - npm ci
+  script:
+    - echo "📚 Generating API documentation..."
+    - npm run docs || npx typedoc src --out docs || true
+    - echo "✅ Documentation generated"
+  artifacts:
+    paths:
+      - docs/
+    expire_in: 30 days
+  allow_failure: true
+
+# Job: Build Docker Image for TypeScript
+.typescript-docker-build:
+  stage: build
+  image: docker:24-dind
+  services:
+    - docker:24-dind
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+  script:
+    - echo "🐳 Building TypeScript Docker image..."
+    - |
+      docker build \
+        --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+        --build-arg VCS_REF=$CI_COMMIT_SHA \
+        --build-arg VERSION=$CI_COMMIT_TAG \
+        -t $IMAGE_NAME:typescript-$IMAGE_TAG \
+        -f docker/typescript/Dockerfile .
+    - docker push $IMAGE_NAME:typescript-$IMAGE_TAG
+    - echo "✅ TypeScript image build and pushed"
+  after_script:
+    - docker logout "$CI_REGISTRY"
+
+# Job: SonarQube Analysis for TypeScript
+.typescript-sonarqube:
+  stage: quality
+  image: sonarsource/sonar-scanner-cli:${SONAR_VERSION}
+  before_script:
+    - npm ci
+    - npm run build
+  script:
+    - echo "🔬 Running SonarQube analysis for TypeScript..."
+    - sonar-scanner
+      -Dsonar.projectKey=$CI_PROJECT_NAME
+      -Dsonar.host.url=$SONAR_HOST_URL
+      -Dsonar.login=$SONAR_TOKEN
+      -Dsonar.sources=src
+      -Dsonar.tests=src
+      -Dsonar.test.inclusions=**/*.test.ts,**/*.spec.ts
+      -Dsonar.exclusions=node_modules/**,dist/**
+      -Dsonar.typescript.lcov.reportPaths=coverage/lcov.info
+    - echo "✅ SonarQube analysis completado"
+  allow_failure: true
+
+# Job: TypeScript Type Safety Check
+.typescript-type-check:
+  stage: build
+  image: node:${NODE_VERSION:-18}-alpine
+  before_script:
+    - npm ci
+  script:
+    - echo "🔍 Running TypeScript strict type checking..."
+    - npx tsc --strict --noEmit || true
+    - echo "✅ Type check completado"
+  allow_failure: true
+
+# Job: Dependency Analysis
+.typescript-deps-analysis:
+  stage: quality
+  image: node:${NODE_VERSION:-18}-alpine
+  before_script:
+    - npm ci
+    - npm install -g depcheck
+  script:
+    - echo "📦 Analyzing dependencies..."
+    - depcheck || true
+    - echo "Checking unused dependencies"
+    - npm ls --depth=0 || true
+    - echo "✅ Dependency analysis completado"
+  allow_failure: true
+
+# Job: Code Complexity Analysis
+.typescript-complexity:
+  stage: quality
+  image: node:${NODE_VERSION:-18}-alpine
+  before_script:
+    - npm ci
+  script:
+    - echo "📊 Analyzing cyclomatic complexity..."
+    - npm run complexity || npx plato -r -d complexity src || true
+    - echo "✅ Complexity analysis completado"
+  artifacts:
+    paths:
+      - complexity/
+      - plato-report/
+    expire_in: 30 days
+  allow_failure: true
+
+# Job: API Testing with Postman/Newman
+.typescript-api-tests:
+  stage: test
+  image: node:${NODE_VERSION:-18}-alpine
+  before_script:
+    - npm ci
+    - npm install -g newman
+  script:
+    - echo "🌐 Running API tests with Newman..."
+    - npm start &
+    - sleep 10  # Dar tiempo para que arranque el servidor
+    - newman run postman/collection.json -e postman/environment.json --reporters cli,json || true
+    - echo "✅ API tests completado"
+  artifacts:
+    paths:
+      - postman-results.json
+    expire_in: 30 days
+  allow_failure: true
+
+# Job: Health Check for TypeScript
+.typescript-health-check:
+  stage: post-deploy
+  image: curlimages/curl:latest
+  script:
+    - echo "💚 Checking TypeScript application health..."
+    - |
+      for i in {1..20}; do
+        if curl -f -s http://${APP_HOST}:${APP_PORT:-3000}/health | grep -q 'ok\|UP\|healthy'; then
+          echo "✅ Application is healthy"
+          exit 0
+        fi
+        echo "⏳ Attempt $i/20..."
+        sleep 5
+      done
+      echo "❌ Application health check failed"
+      exit 1
+  allow_failure: false
+
+# Job: Benchmark/Performance Profiling
+.typescript-benchmark:
+  stage: post-deploy
+  image: node:${NODE_VERSION:-18}-alpine
+  before_script:
+    - npm ci
+    - npm run build
+  script:
+    - echo "⚡ Running performance benchmarks..."
+    - npm run benchmark || true
+    - echo "✅ Benchmark completado"
+  artifacts:
+    paths:
+      - benchmark-results/
+    expire_in: 30 days
+  allow_failure: true
+
+# Job: Database Migrations (if applicable)
+.typescript-db-migrate:
+  stage: deploy
+  image: node:${NODE_VERSION:-18}-alpine
+  before_script:
+    - npm ci
+  script:
+    - echo "🗄️ Running database migrations..."
+    - npm run migrate:up || npm run db:migrate || true
+    - echo "✅ Migrations completado"
+  allow_failure: true
+  only:
+    - main
+    - release

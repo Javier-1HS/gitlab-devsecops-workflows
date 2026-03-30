@@ -1,0 +1,127 @@
+# Template compartido para tareas de seguridad
+# Incluye escaneo de secretos, dependencias y análisis de vulnerabilidades
+
+# Job: Secret Scanning - Detecta secretos expuestos
+.secret-scanning:
+  stage: security-scan
+  image: 
+    name: trufflesecurity/trufflehog:3.5.0 # Versión fija para estabilidad
+    entrypoint: [""] # Necesario en algunos runners para sobrescribir el entrypoint de Docker
+  variables:
+    GIT_DEPTH: 0 # TruffleHog necesita el historial para comparar, pero puedes limitarlo
+  script:
+    - echo "🔍 Escaneando secretos en el repositorio..."
+    - |
+      # Escaneo de Git: Solo los nuevos commits para mayor velocidad
+      trufflehog git file://$(pwd) --only-verified --fail
+  artifacts:
+    when: always
+    paths:
+      - trufflehog-results.json # Si decides exportar logs
+    expire_in: 1 week
+  allow_failure: false # En seguridad de secretos, usualmente NO queremos permitir fallos
+
+# Job: Dependency Check - Analiza vulnerabilidades en dependencias
+.dependency-check:
+  stage: security-scan
+  image: 
+    name: owasp/dependency-check:9.0.0 # Versión fija para estabilidad
+    entrypoint: [""] # NNecesario en algunos runners para sobrescribir el entrypoint de Docker
+  variables:
+    # Directorio de datos para persistir entre ejecuciones
+    DC_DATA_DIR: "${CI_PROJECT_DIR}/.dependency-check-data"
+  script:
+    - echo "🔍 Analizando vulnerabilidades en dependencias..."
+    - |
+      /usr/share/dependency-check/bin/dependency-check.sh \
+        --project "${CI_PROJECT_ID}" \
+        --scan "./" \
+        --format "HTML" \
+        --format "JSON" \
+        --data "${DC_DATA_DIR}" \
+        --out "." \
+        --failOnCVSS 7 \
+        --enableRetired
+  cache:
+    key: "dependency-check-nvd-db"
+    paths:
+      - .dependency-check-data
+  artifacts:
+    when: always
+    paths:
+      - dependency-check-report.html
+      - dependency-check-report.json
+    expire_in: 1 week
+
+# Job: SonarQube Analysis - Análisis de calidad y seguridad de código
+.sonarqube-analysis:
+  stage: quality
+  image: 
+    name: sonarsource/sonar-scanner-cli:11 # Usar versión mayor fija
+    entrypoint: [""] # Necesario en algunos runners para sobrescribir el entrypoint de Docker
+  variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar" # Caché de plugins de Sonar
+    GIT_DEPTH: "0" # Importante: Sonar necesita historial completo para el "Blame" (autores)
+  cache:
+    key: "${CI_JOB_NAME}"
+    paths:
+      - .sonar/cache
+  script:
+    - |
+      sonar-scanner \
+        -Dsonar.projectKey=${CI_PROJECT_PATH_SLUG} \
+        -Dsonar.host.url=${SONAR_HOST_URL} \
+        -Dsonar.token=${SONAR_TOKEN} \
+        -Dsonar.qualitygate.wait=true \
+        -Dsonar.java.binaries=**/target/classes \
+        -Dsonar.javascript.lcov.reportPaths=**/coverage/lcov.info \
+        -Dsonar.scm.provider=git
+  allow_failure: true # Recomendado en transición, false para cumplimiento estricto
+
+# Job: Container Image Scanning - Escanea imagen Docker con Trivy
+.container-scan:
+  stage: vulnerability
+  image: aquasec/trivy:${TRIVY_VERSION:0.48.0} # que debe reemplazarse por una versión específica (ej. 0.48.0, latest)
+    name: aquasec/trivy
+    entrypoint: [""] # Necesario en algunos runners para sobrescribir el entrypoint de Docker
+  variables:
+    TRIVY_NO_PROGRESS: "true"
+    TRIVY_CACHE_DIR: ".trivycache/"
+    # Target suele ser la imagen ya construida en la etapa de Build
+    IMAGE_SCAN_TARGET: "${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHA}"
+  cache:
+    key: trivy-db-cache
+    paths:
+      - .trivycache/
+  script:
+    - echo "🔍 Escaneando imagen: ${IMAGE_SCAN_TARGET}"
+    # 1. Reporte completo para el dashboard de seguridad
+    - trivy image --severity HIGH,CRITICAL --format json --output trivy-report.json ${IMAGE_SCAN_TARGET}
+    # 2. Bloqueo del pipeline solo por CRITICAL (Exit code 1)
+    - trivy image --severity CRITICAL --exit-code 1 --ignore-unfixed ${IMAGE_SCAN_TARGET}
+  artifacts:
+    when: always
+    reports:
+      container_scanning: trivy-report.json
+    paths:
+      - trivy-report.json
+    expire_in: 30 days
+  allow_failure: false # En escaneo de vulnerabilidades, usualmente NO queremos permitir fallos
+
+# Job: Code Coverage Report
+.code-coverage:
+  stage: quality
+  # Regex para capturar el porcentaje en la consola (ajustada para ser más universal)
+  coverage: '/(?i)total.*?(\d+(?:\.\d+)?)%/'
+  artifacts:
+    name: "coverage-${CI_PROJECT_NAME}-${CI_COMMIT_REF_SLUG}"
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        # Usamos globbing para encontrar el XML sin importar el stack
+        path: "**/coverage/cobertura-coverage.xml"
+    paths:
+      - "**/coverage/"
+      - "**/target/site/jacoco/"
+    expire_in: 30 days
+  when: always # Queremos ver la cobertura incluso si algunas pruebas fallaron

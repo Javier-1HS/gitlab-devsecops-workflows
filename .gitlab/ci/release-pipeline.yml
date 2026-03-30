@@ -1,0 +1,293 @@
+# Pipeline para rama RELEASE
+# Despliegue a ambiente QA/Staging con aprobaciones formales
+
+# ============================================================================
+# JOBS ESPECÍFICOS PARA RELEASE
+# ============================================================================
+
+# Job: Automated Tests (E2E)
+e2e-tests:
+  stage: test
+  image: cypress/included:13.6.0
+  script:
+    - echo " Ejecutando pruebas E2E automatizadas..."
+    - cypress run --config-file cypress.config.js
+    - echo " Pruebas E2E completadas"
+  artifacts:
+    when: always
+    reports:
+      junit: cypress/results/junit-*.xml
+    paths:
+      - cypress/screenshots/
+      - cypress/videos/
+      - cypress/results/
+    expire_in: 30 days
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "release"'
+  allow_failure: false
+
+# Job: Security Tests
+security-tests:
+  stage: test
+  image: owasp/zap2docker-stable:latest
+  script:
+    - echo " Ejecutando pruebas de seguridad OWASP ZAP..."
+    - |
+      zap-baseline.py \
+        -t $STAGING_URL \
+        -r zap-baseline-report.html \
+        -J zap-baseline-report.json \
+        || true
+    - echo " Pruebas de seguridad completadas"
+  artifacts:
+    paths:
+      - zap-baseline-report.html
+      - zap-baseline-report.json
+    expire_in: 30 days
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "release"'
+  allow_failure: true
+
+# Job: Aprobación Manual de QA
+qa-approval:
+  stage: approval
+  script:
+    - echo "⏸ Esperando aprobación de QA..."
+    - echo "  Equipo de QA debe revisar:"
+    - echo "  - Pruebas E2E ejecutadas correctamente"
+    - echo "  - Análisis de vulnerabilidades sin críticos"
+    - echo "  - Funcionalidades según especificaciones"
+    - echo "  - Pruebas de regresión pasadas"
+  environment:
+    name: staging-approval
+  when: manual
+  allow_failure: false
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "release"'
+
+# Job: Deploy to Staging/QA
+deploy-to-staging:
+  stage: deploy
+  image: google/cloud-sdk:alpine
+  before_script:
+    - echo "$GCP_SERVICE_ACCOUNT_KEY" | base64 -d > ${HOME}/gcp-key.json
+    - gcloud auth activate-service-account --key-file ${HOME}/gcp-key.json
+    - gcloud config set project $GCP_PROJECT_ID
+    - gcloud container clusters get-credentials $GKE_CLUSTER_STAGING --region $GCP_REGION
+    - kubectl version --client
+  script:
+    - echo " Desplegando a ambiente Staging/QA..."
+    
+    # Crear namespace si no existe
+    - kubectl create namespace $K8S_NAMESPACE_STAGING --dry-run=client -o yaml | kubectl apply -f -
+    
+    # Configurar imagen
+    - export IMAGE_FULL="$IMAGE_NAME:release-$IMAGE_TAG"
+    
+    # Crear secret para pull de imagen si no existe
+    - |
+      kubectl create secret docker-registry regcred \
+        --docker-server=$CI_REGISTRY \
+        --docker-username=$CI_REGISTRY_USER \
+        --docker-password=$CI_REGISTRY_PASSWORD \
+        --docker-email=$GITLAB_USER_EMAIL \
+        -n $K8S_NAMESPACE_STAGING \
+        --dry-run=client -o yaml | kubectl apply -f -
+    
+    # Aplicar ConfigMaps y Secrets
+    - kubectl apply -f infrastructure/kubernetes/apps/staging/configmap.yaml -n $K8S_NAMESPACE_STAGING
+    - |
+      # Crear secrets desde Google Secret Manager
+      kubectl create secret generic app-secrets \
+        --from-literal=database-url=$DATABASE_URL_STAGING \
+        --from-literal=api-key=$API_KEY_STAGING \
+        -n $K8S_NAMESPACE_STAGING \
+        --dry-run=client -o yaml | kubectl apply -f -
+    
+    # Aplicar Deployment
+    - |
+      cat infrastructure/kubernetes/apps/staging/deployment.yaml | \
+      sed "s|IMAGE_PLACEHOLDER|$IMAGE_FULL|g" | \
+      sed "s|NAMESPACE_PLACEHOLDER|$K8S_NAMESPACE_STAGING|g" | \
+      kubectl apply -f -
+    
+    # Aplicar Service y otros recursos
+    - kubectl apply -f infrastructure/kubernetes/apps/staging/service.yaml -n $K8S_NAMESPACE_STAGING
+    - kubectl apply -f infrastructure/kubernetes/apps/staging/hpa.yaml -n $K8S_NAMESPACE_STAGING
+    
+    # Esperar despliegue
+    - kubectl rollout status deployment/${CI_PROJECT_NAME} -n $K8S_NAMESPACE_STAGING --timeout=10m
+    
+    # Verificar pods
+    - kubectl get pods -n $K8S_NAMESPACE_STAGING -l app=${CI_PROJECT_NAME}
+    
+    - echo " Despliegue a Staging completado"
+    
+    # Obtener URL del servicio
+    - |
+      SERVICE_URL=$(kubectl get svc ${CI_PROJECT_NAME} -n $K8S_NAMESPACE_STAGING -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+      echo " Aplicación disponible en: http://$SERVICE_URL"
+      echo "STAGING_URL=http://$SERVICE_URL" >> deploy-staging.env
+  environment:
+    name: staging
+    url: http://$SERVICE_URL
+    on_stop: stop-staging
+  artifacts:
+    reports:
+      dotenv: deploy-staging.env
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "release"'
+  dependencies:
+    - build-image
+    - qa-approval
+
+# Job: Smoke Tests en Staging
+smoke-tests-staging:
+  stage: post-deploy
+  image: curlimages/curl:latest
+  script:
+    - echo " Ejecutando smoke tests en Staging..."
+    - sleep 45  # Dar tiempo para que la app arranque completamente
+    
+    # Health check
+    - |
+      if ! curl -f -s http://${STAGING_URL}/health > /dev/null; then
+        echo " Health check falló"
+        exit 1
+      fi
+    
+    # Ready check
+    - |
+      if ! curl -f -s http://${STAGING_URL}/ready > /dev/null; then
+        echo " Ready check falló"
+        exit 1
+      fi
+    
+    # Version check
+    - |
+      VERSION=$(curl -s http://${STAGING_URL}/version | jq -r '.version')
+      echo " Versión desplegada: $VERSION"
+    
+    - echo " Smoke tests pasaron correctamente"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "release"'
+  dependencies:
+    - deploy-to-staging
+  allow_failure: false
+
+# Job: Regression Tests en Staging
+regression-tests:
+  stage: post-deploy
+  image: node:18-alpine
+  before_script:
+    - npm ci
+  script:
+    - echo " Ejecutando pruebas de regresión..."
+    - export API_URL=$STAGING_URL
+    - npm run test:regression
+    - echo " Pruebas de regresión completadas"
+  artifacts:
+    reports:
+      junit: regression-test-results.xml
+    paths:
+      - regression-test-results/
+    expire_in: 30 days
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "release"'
+  dependencies:
+    - deploy-to-staging
+  allow_failure: false
+
+# Job: Aprobación de Líder Técnico / Certificación
+technical-lead-approval:
+  stage: approval
+  script:
+    - echo "⏸ Esperando aprobación de Líder Técnico / Certificación..."
+    - echo "   Líder Técnico debe validar:"
+    - echo "  - Calidad del código (SonarQube)"
+    - echo "  - Cobertura de pruebas > 80%"
+    - echo "  - Todos los tests pasaron"
+    - echo "  - Sin vulnerabilidades críticas"
+    - echo "  - Documentación actualizada"
+    - echo "  - Cumplimiento de estándares"
+  environment:
+    name: technical-approval
+  when: manual
+  allow_failure: false
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "release"'
+  dependencies:
+    - smoke-tests-staging
+    - regression-tests
+
+# Job: Tag Image for Release
+tag-release-image:
+  stage: deploy
+  image: google/cloud-sdk:alpine
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+  script:
+    - echo " Etiquetando imagen para release..."
+    - |
+      # Obtener versión del package.json o similar
+      VERSION=$(cat package.json | grep version | head -1 | awk -F: '{ print $2 }' | sed 's/[",]//g' | tr -d '[[:space:]]')
+      
+      # Pull de la imagen actual
+      docker pull $IMAGE_NAME:release-$IMAGE_TAG
+      
+      # Tag con versión semántica
+      docker tag $IMAGE_NAME:release-$IMAGE_TAG $IMAGE_NAME:v$VERSION
+      docker tag $IMAGE_NAME:release-$IMAGE_TAG $IMAGE_NAME:release-stable
+      
+      # Push de los nuevos tags
+      docker push $IMAGE_NAME:v$VERSION
+      docker push $IMAGE_NAME:release-stable
+      
+      echo " Imagen etiquetada como v$VERSION y release-stable"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "release"'
+  dependencies:
+    - technical-lead-approval
+
+# Job: Stop Staging Environment (manual)
+stop-staging:
+  stage: deploy
+  image: google/cloud-sdk:alpine
+  before_script:
+    - echo "$GCP_SERVICE_ACCOUNT_KEY" | base64 -d > ${HOME}/gcp-key.json
+    - gcloud auth activate-service-account --key-file ${HOME}/gcp-key.json
+    - gcloud config set project $GCP_PROJECT_ID
+    - gcloud container clusters get-credentials $GKE_CLUSTER_STAGING --region $GCP_REGION
+  script:
+    - echo " Deteniendo ambiente Staging..."
+    - kubectl delete deployment ${CI_PROJECT_NAME} -n $K8S_NAMESPACE_STAGING --ignore-not-found=true
+    - kubectl delete service ${CI_PROJECT_NAME} -n $K8S_NAMESPACE_STAGING --ignore-not-found=true
+    - kubectl delete hpa ${CI_PROJECT_NAME} -n $K8S_NAMESPACE_STAGING --ignore-not-found=true
+    - echo " Ambiente Staging detenido"
+  environment:
+    name: staging
+    action: stop
+  when: manual
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "release"'
+
+# Job: Rollback Staging (manual)
+rollback-staging:
+  stage: rollback
+  image: google/cloud-sdk:alpine
+  before_script:
+    - echo "$GCP_SERVICE_ACCOUNT_KEY" | base64 -d > ${HOME}/gcp-key.json
+    - gcloud auth activate-service-account --key-file ${HOME}/gcp-key.json
+    - gcloud config set project $GCP_PROJECT_ID
+    - gcloud container clusters get-credentials $GKE_CLUSTER_STAGING --region $GCP_REGION
+  script:
+    - echo " Realizando rollback en Staging..."
+    - kubectl rollout undo deployment/${CI_PROJECT_NAME} -n $K8S_NAMESPACE_STAGING
+    - kubectl rollout status deployment/${CI_PROJECT_NAME} -n $K8S_NAMESPACE_STAGING --timeout=5m
+    - echo " Rollback completado en Staging"
+  environment:
+    name: staging
+    action: rollback
+  when: manual
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "release"'
